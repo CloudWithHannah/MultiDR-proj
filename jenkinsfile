@@ -1,0 +1,158 @@
+pipeline {
+  agent any
+ 
+  // Environment variables available to all stages
+  environment {
+    AWS_REGION      = 'eu-north-1'
+    DR_REGION       = 'eu-west-1'
+    APP_DIR         = 'app'
+    TF_DIR          = 'terraform/dr-region'
+    DB_PASSWORD     = credentials('db-password')
+    SLACK_WEBHOOK   = credentials('slack-webhook') 
+  }
+ 
+  stages {
+ 
+    stage('Checkout') {
+      steps {
+        checkout scm  // Clones the repo that triggered this build
+        echo "Building commit: ${env.GIT_COMMIT[0..7]}"
+      }
+    }
+ 
+    stage('Terraform Validate') {
+      steps {
+        dir(env.TF_DIR) {
+          sh 'terraform init -reconfigure'
+          sh 'terraform validate'  
+          sh 'terraform fmt -check' 
+        }
+      }
+    }
+ 
+    stage('Terraform Plan') {
+      steps {
+        dir(env.TF_DIR) {
+          sh '''
+            terraform plan \
+              -var="db_password=${DB_PASSWORD}" \
+              -out=tfplan  // Saves plan to file so apply uses exact same plan
+          '''
+        }
+      }
+    }
+ 
+    stage('Approval') {
+      when {
+        branch 'main'
+      }
+      steps {
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: 'Deploy DR infrastructure?',
+                ok: 'Deploy'
+          // Pipeline pauses here. Someone must click Deploy in Jenkins UI.
+        }
+      }
+    }
+ 
+    stage('Terraform Apply') {
+      when {
+        branch 'main'
+      }
+      steps {
+        dir(env.TF_DIR) {
+          sh 'terraform apply -auto-approve tfplan'
+        }
+      }
+    }
+ 
+    stage('Deploy Application') {
+      when {
+        branch 'main'
+      }
+      steps {
+        sh '''
+          # Package the app
+          cd app && zip -r ../myapp.zip . && cd ..
+ 
+          # Copy to S3 (acts as deployment artifact store)
+          aws s3 cp myapp.zip \
+            s3://myapp-assets-primary-eu-north-1/deployments/myapp.zip \
+            --region ${AWS_REGION}
+ 
+          # Get the instance ID managed by the ASG
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names myapp-asg \
+            --region ${AWS_REGION} \
+            --query 'AutoScalingGroups[0].Instances[0].InstanceId' \
+            --output text)
+ 
+          echo "Deploying to instance: $INSTANCE_ID"
+ 
+          # Run deployment commands on the instance via SSM
+          aws ssm send-command \
+            --instance-ids $INSTANCE_ID \
+            --region ${AWS_REGION} \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=[
+              "aws s3 cp s3://myapp-assets-primary-eu-north-1/deployments/myapp.zip /tmp/",
+              "unzip -o /tmp/myapp.zip -d /opt/myapp/",
+              "cd /opt/myapp && venv/bin/pip install -r requirements.txt -q",
+              "sudo systemctl restart myapp"
+            ]'
+        '''
+      }
+    }
+ 
+    // ── Stage 7: Verify the deployment worked ─────────
+    stage('Smoke Test') {
+      steps {
+        sh '''
+          echo 'Waiting 20 seconds for app to start...'
+          sleep 20
+ 
+          # Get the ALB DNS name from Terraform output
+          ALB_DNS=$(cd terraform/dr-region && \
+            terraform output -raw dr_alb_dns_name)
+ 
+          # Call the health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://${ALB_DNS}/health)
+ 
+          echo "Health check returned: $HTTP_CODE"
+ 
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo 'SMOKE TEST FAILED'
+            exit 1  // Non-zero exit fails the stage and stops the pipeline
+          fi
+ 
+          echo 'Smoke test passed!'
+        '''
+      }
+    }
+ 
+  }
+ 
+  // ── Post-pipeline actions (always run) ────────────────
+  post {
+  success {
+    sh """
+      curl -X POST -H 'Content-type: application/json' \
+      --data '{"text":"✅Deploy succeeded | Job: ${env.JOB_NAME} | Commit: ${env.GIT_COMMIT[0..7]}"}' \
+      ${SLACK_WEBHOOK}
+    """
+  }
+  failure {
+    sh """
+      curl -X POST -H 'Content-type: application/json' \
+      --data '{"text":"🔴Deploy FAILED | Job: ${env.JOB_NAME} | See: ${env.BUILD_URL}"}' \
+      ${SLACK_WEBHOOK}
+    """
+  }
+  always {
+    cleanWs()
+  }
+}
+ 
+}
+
