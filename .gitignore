@@ -1,2 +1,15 @@
 session-manager-plugin.deb
 
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tfplan
+
+# Credentials — never commit these
+*.pem
+*.key
+
+# OS
+.DS_Store
