@@ -46,6 +46,13 @@ pipeline {
       when {
         branch 'main'
       }
+      steps {
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: 'Deploy DR infrastructure?',
+                ok: 'Deploy'
+          // Pipeline pauses here. Someone must click Deploy in Jenkins UI.
+        }
+      }
     }
  
     stage('Terraform Apply') {
